@@ -1,111 +1,165 @@
-/**
- * Megumin Command - Get random megumin anime images
- */
-
 const axios = require('axios');
+const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { getTempDir, deleteTempFile } = require('../../utils/tempManager');
+const webp = require('node-webpmux');
+const crypto = require('crypto');
 
-const BASE = 'https://api.princetechn.com/api/anime/megumin';
-const API_KEY = 'prince';
+const ANIMU_BASE = 'https://api.some-random-api.com/animu';
 
-module.exports = {
-  name: 'megumin',
-  aliases: ['meguminnsfw'],
-  category: 'anime',
-  desc: 'Get random megumin NSFW anime images',
-  usage: 'megumin',
-  execute: async (sock, msg, args, extra) => {
-    try {
-      const url = `${BASE}?apikey=${API_KEY}`;
-      const response = await axios.get(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0',
-          'Accept': 'application/json'
-        },
-        timeout: 30000
-      });
-      
-      if (!response.data || !response.data.result) {
-        throw new Error('Invalid API response: missing image URL');
-      }
-      
-      const imageUrl = response.data.result;
-      
-      if (!imageUrl || typeof imageUrl !== 'string') {
-        throw new Error('Invalid image URL in API response');
-      }
-      
-      const imageResponse = await axios.get(imageUrl, {
-        responseType: 'arraybuffer',
-        headers: {
-          'User-Agent': 'Mozilla/5.0',
-          'Accept': 'image/*'
-        },
-        timeout: 30000
-      });
-      
-      const imageBuffer = Buffer.from(imageResponse.data);
-      
-      if (!imageBuffer || imageBuffer.length === 0) {
-        throw new Error('Empty image response');
-      }
-      
-      const maxImageSize = 5 * 1024 * 1024;
-      if (imageBuffer.length > maxImageSize) {
-        throw new Error(`Image too large: ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB (max 5MB)`);
-      }
-      
-      const contentType = imageResponse.headers['content-type'] || '';
-      let extension = 'jpg';
-      if (contentType.includes('png')) {
-        extension = 'png';
-      } else if (contentType.includes('jpeg')) {
-        extension = 'jpg';
-      } else if (imageUrl.match(/\.(png|jpg|jpeg)$/i)) {
-        const match = imageUrl.match(/\.(png|jpg|jpeg)$/i);
-        extension = match[1].toLowerCase();
-      }
-      
-      const tempDir = getTempDir();
-      const timestamp = Date.now();
-      const tempImagePath = path.join(tempDir, `megumin_${timestamp}.${extension}`);
-      
-      let finalBuffer = null;
-      
-      try {
-        fs.writeFileSync(tempImagePath, imageBuffer);
-        finalBuffer = fs.readFileSync(tempImagePath);
-        
-        if (!finalBuffer || finalBuffer.length === 0) {
-          throw new Error('Failed to read image from temp file');
-        }
-        
-        await sock.sendMessage(extra.from, {
-          image: finalBuffer
-        }, { quoted: msg });
-        
-      } finally {
-        try {
-          deleteTempFile(tempImagePath);
-        } catch (cleanupError) {
-        }
-      }
-      
-    } catch (error) {
-      console.error('Error in megumin command:', error);
-      
-      if (error.response?.status === 404) {
-        await extra.reply('❌ Image not found. Please try again.');
-      } else if (error.response?.status === 429) {
-        await extra.reply('❌ Rate limit exceeded. Please try again later.');
-      } else if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-        await extra.reply('❌ Request timed out. Please try again.');
-      } else {
-        await extra.reply(`❌ Failed to fetch megumin image: ${error.message}`);
-      }
+/**
+ * دالة تحويل الأوامر العربية إلى الكلمات الإنجليزية التي يفهمها الموقع
+ */
+function normalizeType(input) {
+    const lower = (input || '').trim().toLowerCase();
+    
+    // ربط الأوامر العربية بما يقابلها في السيرفر
+    if (lower === 'كف' || lower === 'يا إلهي' || lower === 'وجه' || lower === 'facepalm') return 'face-palm';
+    if (lower === 'اقتباس' || lower === 'حكمة' || lower === 'مقولة' || lower === 'quote') return 'quote';
+    if (lower === 'صفع' || lower === 'طرد' || lower === 'slap') return 'poke'; // يمكنك تعديل هذه حسب الرغبة
+    if (lower === 'ضحك' || lower === 'ابتسامة' || lower === 'wink') return 'wink';
+    if (lower === 'بكاء' || lower === 'حزن' || lower === 'cry') return 'cry';
+    if (lower === 'عناق' || lower === 'حضن' || lower === 'hug') return 'hug';
+    
+    return lower;
+}
+
+async function sendAnimu(sock, chatId, message, type) {
+    const endpoint = `${ANIMU_BASE}/${type}`;
+    const res = await axios.get(endpoint);
+    const data = res.data || {};
+
+    async function convertMediaToSticker(mediaBuffer, isAnimated) {
+        const tmpDir = path.join(process.cwd(), 'tmp');
+        if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+
+        const inputExt = isAnimated ? 'gif' : 'jpg';
+        const input = path.join(tmpDir, `animu_${Date.now()}.${inputExt}`);
+        const output = path.join(tmpDir, `animu_${Date.now()}.webp`);
+        fs.writeFileSync(input, mediaBuffer);
+
+        const ffmpegCmd = isAnimated 
+            ? `ffmpeg -y -i "${input}" -vf "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000,fps=15" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality 60 -compression_level 6 "${output}"`
+            : `ffmpeg -y -i "${input}" -vf "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality 75 -compression_level 6 "${output}"`;
+
+        await new Promise((resolve, reject) => {
+            exec(ffmpegCmd, (err) => (err ? reject(err) : resolve()));
+        });
+
+        let webpBuffer = fs.readFileSync(output);
+
+        const img = new webp.Image();
+        await img.load(webpBuffer);
+
+        const json = {
+            'sticker-pack-id': crypto.randomBytes(32).toString('hex'),
+            'sticker-pack-name': 'ملصقات أنمي عربية',
+            'emojis': ['🎌']
+        };
+        const exifAttr = Buffer.from([0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x41, 0x57, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00]);
+        const jsonBuffer = Buffer.from(JSON.stringify(json), 'utf8');
+        const exif = Buffer.concat([exifAttr, jsonBuffer]);
+        exif.writeUIntLE(jsonBuffer.length, 14, 4);
+        img.exif = exif;
+
+        const finalBuffer = await img.save(null);
+
+        try { fs.unlinkSync(input); } catch {}
+        try { fs.unlinkSync(output); } catch {}
+        return finalBuffer;
     }
-  }
-};
 
+    if (data.link) {
+        const link = data.link;
+        const lower = link.toLowerCase();
+        const isGifLink = lower.endsWith('.gif');
+        const isImageLink = lower.match(/\.(jpg|jpeg|png|webp)$/);
+
+        if (isGifLink || isImageLink) {
+            try {
+                const resp = await axios.get(link, {
+                    responseType: 'arraybuffer',
+                    timeout: 15000,
+                    headers: { 'User-Agent': 'Mozilla/5.0' }
+                });
+                const mediaBuf = Buffer.from(resp.data);
+                const stickerBuf = await convertMediaToSticker(mediaBuf, isGifLink);
+                await sock.sendMessage(
+                    chatId,
+                    { sticker: stickerBuf },
+                    { quoted: message }
+                );
+                return;
+            } catch (error) {
+                console.error('Error converting media to sticker:', error);
+            }
+        }
+
+        try {
+            await sock.sendMessage(
+                chatId,
+                { image: { url: link }, caption: `النوع المطلـوب: ${type}` },
+                { quoted: message }
+            );
+            return;
+        } catch {}
+    }
+    if (data.quote) {
+        await sock.sendMessage(
+            chatId,
+            { text: `📝 *الاقتباس:* \n\n${data.quote}` },
+            { quoted: message }
+        );
+        return;
+    }
+
+    await sock.sendMessage(
+        chatId,
+        { text: '❌ فشل في جلب البيانات المطلوبة.' },
+        { quoted: message }
+    );
+}
+
+async function animeCommand(sock, chatId, message, args) {
+    const subArg = args && args[0] ? args[0] : '';
+    const sub = normalizeType(subArg);
+
+    // الأوامر المتاحة بعد تحويلها لقيم يفهمها السيرفر
+    const supported = [
+        'nom', 'poke', 'cry', 'kiss', 'pat', 'hug', 'wink', 'face-palm', 'quote'
+    ];
+
+    // القائمة العربية التي ستظهر للمستخدم عند كتابة الأمر بشكل خاطئ
+    const arabicSupportedList = 'كف, اقتباس, صفع, ضحك, بكاء, عناق';
+
+    try {
+        if (!sub) {
+            await sock.sendMessage(
+                chatId, 
+                { text: `💡 *طريقة الاستخدام:* .أنمي <النوع>\n\n✨ *الأنواع المتوفرة حالياً:* \n[ ${arabicSupportedList} ]` }, 
+                { quoted: message }
+            );
+            return;
+        }
+
+        if (!supported.includes(sub)) {
+            await sock.sendMessage(
+                chatId, 
+                { text: `❌ هذا النوع [ ${subArg} ] غير مدعوم حالياً.\n\nجرّب أحد الأنواع التالية:\n[ ${arabicSupportedList} ]` }, 
+                { quoted: message }
+            );
+            return;
+        }
+
+        await sendAnimu(sock, chatId, message, sub);
+    } catch (err) {
+        console.error('Error in animu command:', err);
+        await sock.sendMessage(
+            chatId, 
+            { text: '❌ حدث خطأ غير متوقع أثناء معالجة طلب الأنمي.' }, 
+            { quoted: message }
+        );
+    }
+}
+
+module.exports = { animeCommand };
